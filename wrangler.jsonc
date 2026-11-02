@@ -8,8 +8,8 @@
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ChatRoom"] }],
   "vars": {
-    "ALLOWED_ORIGINS": "https://your-laravel-domain.com",
-    "LARAVEL_WEBHOOK_URL": "https://your-laravel-domain.com/api/chat/webhook"
+    "ALLOWED_ORIGINS": "https://hangtruyen.online",
+    "LARAVEL_WEBHOOK_URL": "https://hangtruyen.online/api/chat/webhook"
   },
   "observability": { "enabled": true }
 }
