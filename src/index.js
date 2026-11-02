@@ -1,117 +1,192 @@
 import { DurableObject } from "cloudflare:workers";
 
-const MAX_PLAYERS_PER_ROOM = 80;
-const VALID_ROBES = new Set(["blue", "brown", "white", "yellow"]);
+const MAX_USERS_PER_ROOM = 100;
+const MAX_TEXT = 500;
+const MAX_FRAME = 2048;
+const RATE_WINDOW_MS = 10000;
+const RATE_MAX = 5;
+
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
 
 export default {
 	async fetch(request, env) {
 		const url = new URL(request.url);
 
-		if (url.pathname === "/health") {
-			return Response.json({ status: "ok", provider: "cloudflare-durable-objects" });
-		}
-
-		if (url.pathname !== "/ws") {
-			return new Response("Use /ws for the room connection or /health for status.", { status: 404 });
-		}
-
+		if (url.pathname === "/health") return Response.json({ status: "ok" });
+		if (url.pathname !== "/ws") return new Response("Not found", { status: 404 });
 		if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
 			return new Response("WebSocket upgrade required", { status: 426 });
 		}
 
-		const room = url.searchParams.get("room") || "default";
-		if (!/^[A-Za-z0-9_-]{1,64}$/.test(room)) {
-			return new Response("Invalid room", { status: 400 });
+		const allowed = (env.ALLOWED_ORIGINS || "").split(",").map(s => s.trim()).filter(Boolean);
+		if (allowed.length && !allowed.includes(request.headers.get("Origin"))) {
+			return new Response("Forbidden origin", { status: 403 });
 		}
 
-		const roomId = env.GAME_ROOMS.idFromName(room);
-		return env.GAME_ROOMS.get(roomId).fetch(request);
+		const claims = await verifyToken(url.searchParams.get("token"), env.CHAT_SECRET);
+		if (!claims) return new Response("Invalid or expired token", { status: 401 });
+
+		// Danh tính chỉ lấy từ token đã ký, ghi đè mọi thứ client gửi lên
+		const doUrl = new URL(request.url);
+		doUrl.search = "";
+		doUrl.searchParams.set("uid", String(claims.uid));
+		doUrl.searchParams.set("name", String(claims.name || ""));
+		doUrl.searchParams.set("room", claims.room);
+
+		const stub = env.CHAT_ROOMS.get(env.CHAT_ROOMS.idFromName(claims.room), { locationHint: "apac" });
+		return stub.fetch(new Request(doUrl, request));
 	}
 };
 
-export class GameRoom extends DurableObject {
+export class ChatRoom extends DurableObject {
+	constructor(ctx, env) {
+		super(ctx, env);
+		// Heartbeat: không đánh thức DO khi đang ngủ
+		ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
+	}
+
 	async fetch(request) {
 		const url = new URL(request.url);
-		const player = {
-			id: safeText(url.searchParams.get("id"), 64) || crypto.randomUUID(),
-			name: safeText(url.searchParams.get("name"), 25) || "Phật tử",
-			robe: VALID_ROBES.has(url.searchParams.get("robe")) ? url.searchParams.get("robe") : "blue",
-			x: safeNumber(url.searchParams.get("x"), 0, -50, 50),
-			y: safeNumber(url.searchParams.get("y"), 0, -1, 20),
-			z: safeNumber(url.searchParams.get("z"), 25.5, -50, 50),
-			rotY: safeNumber(url.searchParams.get("rotY"), Math.PI, -100, 100),
-			action: "idle"
+		const user = {
+			uid: safeText(url.searchParams.get("uid"), 64),
+			name: safeText(url.searchParams.get("name"), 50) || "Khách",
+			room: safeText(url.searchParams.get("room"), 64),
+			windowStart: 0,
+			count: 0
 		};
+		if (!user.uid || !user.room) return new Response("Bad request", { status: 400 });
 
-		const currentPlayers = this.ctx.getWebSockets()
-			.map(socket => socket.deserializeAttachment())
-			.filter(existing => existing && existing.id !== player.id);
-		if (currentPlayers.length >= MAX_PLAYERS_PER_ROOM) {
+		if (this.onlineUsers(null, user.uid).size >= MAX_USERS_PER_ROOM) {
 			return new Response("Room is full", { status: 429 });
+		}
+
+		// Một user chỉ giữ một kết nối: đóng kết nối cũ (tránh socket ma khi reconnect)
+		for (const s of this.ctx.getWebSockets()) {
+			if (s.deserializeAttachment()?.uid === user.uid) s.close(1000, "Replaced by new connection");
 		}
 
 		const pair = new WebSocketPair();
 		const [client, server] = Object.values(pair);
 		this.ctx.acceptWebSocket(server);
-		server.serializeAttachment(player);
+		server.serializeAttachment(user);
 
-		server.send(JSON.stringify({ type: "cf_welcome", players: currentPlayers }));
-		this.broadcast({ type: "cf_player_joined", player }, server);
+		const users = [...this.onlineUsers().entries()].map(([uid, name]) => ({ uid, name }));
+		server.send(JSON.stringify({ type: "welcome", users, online: users.length }));
+		this.broadcast({ type: "presence", online: users.length });
 
 		return new Response(null, { status: 101, webSocket: client });
 	}
 
-	webSocketMessage(socket, message) {
-		if (typeof message !== "string") return;
+	async webSocketMessage(socket, message) {
+		if (typeof message !== "string" || message.length > MAX_FRAME) return;
 
-		let update;
-		try {
-			update = JSON.parse(message);
-		} catch {
+		let data;
+		try { data = JSON.parse(message); } catch { return; }
+		if (!data || data.type !== "chat") return;
+
+		const user = socket.deserializeAttachment();
+		if (!user) return;
+
+		const text = safeText(data.text, MAX_TEXT);
+		if (!text) return;
+
+		// Rate limit: tối đa RATE_MAX tin / RATE_WINDOW_MS
+		const now = Date.now();
+		if (now - user.windowStart > RATE_WINDOW_MS) {
+			user.windowStart = now;
+			user.count = 0;
+		}
+		user.count++;
+		socket.serializeAttachment(user);
+		if (user.count > RATE_MAX) {
+			socket.send(JSON.stringify({ type: "error", code: "rate_limited" }));
 			return;
 		}
-		if (update.type !== "move") return;
 
-		const player = socket.deserializeAttachment();
-		if (!player) return;
-		player.x = safeNumber(update.x, player.x, -50, 50);
-		player.y = safeNumber(update.y, player.y, -1, 20);
-		player.z = safeNumber(update.z, player.z, -50, 50);
-		player.rotY = safeNumber(update.rotY, player.rotY, -100, 100);
-		player.action = safeText(update.action, 32) || "idle";
-		socket.serializeAttachment(player);
-
-		this.broadcast({ type: "cf_player_moved", ...player }, socket);
+		const msg = { type: "message", id: crypto.randomUUID(), uid: user.uid, name: user.name, text, ts: now };
+		this.broadcast(msg);
+		await this.persist(msg, user.room);
 	}
 
-	webSocketClose(socket) {
-		const player = socket.deserializeAttachment();
-		if (player) this.broadcast({ type: "cf_player_left", id: player.id });
+	webSocketClose(socket) { this.handleLeave(socket); }
+	webSocketError(socket) { this.handleLeave(socket); }
+
+	handleLeave(socket) {
+		const user = socket.deserializeAttachment();
+		if (!user) return;
+		// Chỉ báo "rời" khi user không còn kết nối nào khác (tránh race khi reconnect)
+		const online = this.onlineUsers(socket);
+		if (!online.has(user.uid)) this.broadcast({ type: "presence", online: online.size });
 	}
 
-	webSocketError(socket) {
-		const player = socket.deserializeAttachment();
-		if (player) this.broadcast({ type: "cf_player_left", id: player.id });
+	onlineUsers(excludeSocket = null, excludeUid = null) {
+		const map = new Map();
+		for (const s of this.ctx.getWebSockets()) {
+			if (s === excludeSocket) continue;
+			const u = s.deserializeAttachment();
+			if (u && u.uid !== excludeUid) map.set(u.uid, u.name);
+		}
+		return map;
 	}
 
-	broadcast(message, excludedSocket = null) {
+	broadcast(message) {
 		const payload = JSON.stringify(message);
-		for (const socket of this.ctx.getWebSockets()) {
-			if (socket === excludedSocket) continue;
-			try {
-				socket.send(payload);
-			} catch {
-				socket.close(1011, "Realtime delivery failed");
-			}
+		for (const s of this.ctx.getWebSockets()) {
+			try { s.send(payload); } catch { s.close(1011, "Delivery failed"); }
+		}
+	}
+
+	// Lưu tin nhắn về Laravel (best-effort, Laravel xử lý idempotent theo id)
+	async persist(msg, room) {
+		if (!this.env.LARAVEL_WEBHOOK_URL || !this.env.CHAT_SECRET) return;
+		const body = JSON.stringify({ id: msg.id, room, user_id: msg.uid, name: msg.name, text: msg.text, ts: msg.ts });
+		try {
+			await fetch(this.env.LARAVEL_WEBHOOK_URL, {
+				method: "POST",
+				headers: { "Content-Type": "application/json", "X-Signature": await hmacHex(this.env.CHAT_SECRET, body) },
+				body
+			});
+		} catch (err) {
+			console.error("persist failed", String(err));
 		}
 	}
 }
+
+/* ---------- helpers ---------- */
 
 function safeText(value, maxLength) {
 	return typeof value === "string" ? value.trim().slice(0, maxLength) : "";
 }
 
-function safeNumber(value, fallback, minimum, maximum) {
-	const parsed = Number(value);
-	return Number.isFinite(parsed) ? Math.min(maximum, Math.max(minimum, parsed)) : fallback;
+function b64urlToBytes(str) {
+	const b64 = str.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(str.length / 4) * 4, "=");
+	const bin = atob(b64);
+	return Uint8Array.from(bin, c => c.charCodeAt(0));
+}
+
+async function hmacKey(secret, usage) {
+	return crypto.subtle.importKey("raw", encoder.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, [usage]);
+}
+
+async function hmacHex(secret, body) {
+	const sig = await crypto.subtle.sign("HMAC", await hmacKey(secret, "sign"), encoder.encode(body));
+	return [...new Uint8Array(sig)].map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+// Token: base64url(JSON).base64url(HMAC-SHA256(body))
+async function verifyToken(token, secret) {
+	if (!token || !secret) return null;
+	try {
+		const [body, sig] = token.split(".");
+		if (!body || !sig) return null;
+		const ok = await crypto.subtle.verify("HMAC", await hmacKey(secret, "verify"), b64urlToBytes(sig), encoder.encode(body));
+		if (!ok) return null;
+		const claims = JSON.parse(decoder.decode(b64urlToBytes(body)));
+		if (!claims.exp || claims.exp < Math.floor(Date.now() / 1000)) return null;
+		if (!claims.uid || !/^[A-Za-z0-9_-]{1,64}$/.test(claims.room || "")) return null;
+		return claims;
+	} catch {
+		return null;
+	}
 }
