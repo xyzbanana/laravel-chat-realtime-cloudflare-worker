@@ -33,6 +33,7 @@ export default {
 		doUrl.searchParams.set("uid", String(claims.uid));
 		doUrl.searchParams.set("name", String(claims.name || ""));
 		doUrl.searchParams.set("room", claims.room);
+		doUrl.searchParams.set("avatar", String(claims.avatar || ""));
 
 		const stub = env.CHAT_ROOMS.get(env.CHAT_ROOMS.idFromName(claims.room), { locationHint: "apac" });
 		return stub.fetch(new Request(doUrl, request));
@@ -52,6 +53,7 @@ export class ChatRoom extends DurableObject {
 			uid: safeText(url.searchParams.get("uid"), 64),
 			name: safeText(url.searchParams.get("name"), 50) || "Khách",
 			room: safeText(url.searchParams.get("room"), 64),
+			avatar: safeAvatar(url.searchParams.get("avatar")),
 			windowStart: 0,
 			count: 0
 		};
@@ -104,7 +106,7 @@ export class ChatRoom extends DurableObject {
 			return;
 		}
 
-		const msg = { type: "message", id: crypto.randomUUID(), uid: user.uid, name: user.name, text, ts: now };
+		const msg = { type: "message", id: crypto.randomUUID(), uid: user.uid, name: user.name, avatar: user.avatar || null, text, ts: now };
 		this.broadcast(msg);
 		await this.persist(msg, user.room);
 	}
@@ -157,6 +159,11 @@ export class ChatRoom extends DurableObject {
 
 function safeText(value, maxLength) {
 	return typeof value === "string" ? value.trim().slice(0, maxLength) : "";
+}
+
+function safeAvatar(value) {
+	const v = safeText(value, 300);
+	return /^https?:\/\//i.test(v) ? v : "";
 }
 
 function b64urlToBytes(str) {
