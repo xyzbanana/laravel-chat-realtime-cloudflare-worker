@@ -176,17 +176,21 @@ async function hmacHex(secret, body) {
 
 // Token: base64url(JSON).base64url(HMAC-SHA256(body))
 async function verifyToken(token, secret) {
-	if (!token || !secret) return null;
+	if (!secret) { console.log("auth: CHAT_SECRET missing on Worker"); return null; }
+	if (!token) { console.log("auth: no token"); return null; }
 	try {
 		const [body, sig] = token.split(".");
-		if (!body || !sig) return null;
+		if (!body || !sig) { console.log("auth: malformed token"); return null; }
 		const ok = await crypto.subtle.verify("HMAC", await hmacKey(secret, "verify"), b64urlToBytes(sig), encoder.encode(body));
-		if (!ok) return null;
+		if (!ok) { console.log("auth: bad signature (secret mismatch)"); return null; }
 		const claims = JSON.parse(decoder.decode(b64urlToBytes(body)));
-		if (!claims.exp || claims.exp < Math.floor(Date.now() / 1000)) return null;
-		if (!claims.uid || !/^[A-Za-z0-9_-]{1,64}$/.test(claims.room || "")) return null;
+		const now = Math.floor(Date.now() / 1000);
+		if (!claims.exp || claims.exp < now) { console.log("auth: expired", claims.exp, now); return null; }
+		if (!claims.uid || !/^[A-Za-z0-9_-]{1,64}$/.test(claims.room || "")) { console.log("auth: bad uid/room"); return null; }
 		return claims;
-	} catch {
+	} catch (err) {
+		console.log("auth: exception", String(err));
 		return null;
 	}
+}
 }
